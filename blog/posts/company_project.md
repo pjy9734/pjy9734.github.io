@@ -197,3 +197,108 @@ JWT 过滤器的执行顺序在 Spring Security 鉴权之前，
 告警。
 • 代码优化：重构重复代码，提取公共⽅法，提升代码可读性、可维护性；完善单元测试，覆盖所有
 场景。
+
+# 七、系统优化任务
+1.内存优化。
+公司服务器分为测试服务器与生产服务器。测试服务器用于部署开发基础设施与测试应用，生产服务器用于部署生产应用。由于两台服务器内存都较小，现在以测试服务器作为优化试点服务器，进行优化尝试，成功后再对生产服务器进行优化。
+
+## 测试服务器
+现在测试服务器的内存极高占用，7.3g/7.5g，急需优化内存占用。
+首先，使用命令“top -o =%MEM -e =g”按内存占用降序排列查看内存占用进程。
+PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND                                      
+3199430 nexus     20   0    3.9g   1.5g   0.0g S   0.3  20.6 145:07.91 java                                         
+1320611 mysql     20   0    1.8g   1.1g   0.0g S   0.3  14.7 201:42.45 mysqld                                       
+3115678 root      20   0    2.4g   0.7g   0.0g S   1.0   9.9 199:47.70 java                                         
+2923355 root      39  19    1.0g   0.7g   0.0g T   0.0   9.5     7d+3h [kswapd0]                                      
+
+内存占用最显著的4个进程分别为nexus repository、mysql、我自己部署的java应用服务以及“kswapd0”。
+kswapd0是系统内存交换进程，由于服务器物理内存耗尽，系统使用swap将内存数据存入硬盘使用。
+
+### nexus内存优化
+先从内存占用最高的nexus repository开始优化，nexus repository的内存总占用为1.5g。
+找到nexus.vmoptions，查看jvm配置。
+```
+-Xms1024m
+-Xmx1024m
+-XX:+UnlockDiagnosticVMOptions
+-XX:+LogVMOutput
+-XX:LogFile=../sonatype-work/nexus3/log/jvm.log
+-XX:-OmitStackTraceInFastThrow
+-Dkaraf.home=.
+-Dkaraf.base=.
+-Djava.util.logging.config.file=etc/spring/java.util.logging.properties
+-Dkaraf.data=../sonatype-work/nexus3
+-Dkaraf.log=../sonatype-work/nexus3/log
+-Djava.io.tmpdir=../sonatype-work/nexus3/tmp
+-Djdk.tls.ephemeralDHKeySize=2048
+-Dfile.encoding=UTF-8
+#
+# additional vmoptions needed for Java9+
+#
+--add-reads=java.xml=java.logging
+--add-opens
+java.base/java.security=ALL-UNNAMED
+--add-opens
+java.base/java.net=ALL-UNNAMED
+--add-opens
+java.base/java.lang=ALL-UNNAMED
+--add-opens
+java.base/java.util=ALL-UNNAMED
+--add-opens
+java.naming/javax.naming.spi=ALL-UNNAMED
+--add-opens
+java.rmi/sun.rmi.transport.tcp=ALL-UNNAMED
+--add-exports=java.base/sun.net.www.protocol.http=ALL-UNNAMED
+--add-exports=java.base/sun.net.www.protocol.https=ALL-UNNAMED
+--add-exports=java.base/sun.net.www.protocol.jar=ALL-UNNAMED
+--add-exports=jdk.xml.dom/org.w3c.dom.html=ALL-UNNAMED
+--add-exports=jdk.naming.rmi/com.sun.jndi.url.rmi=ALL-UNNAMED
+--add-exports=java.security.sasl/com.sun.security.sasl=ALL-UNNAMED
+--add-exports=java.base/sun.security.x509=ALL-UNNAMED
+--add-exports=java.base/sun.security.rsa=ALL-UNNAMED
+--add-exports=java.base/sun.security.pkcs=ALL-UNNAMED
+```
+-Xms为最小堆内存，-Xmx是最大堆内存，这里都配置的是1024m，那么多余的500m就是堆外内存。
+堆外内存包括：JVM自身运行，线程栈，直接内存（网络、文件，NIO），共享库、内存映射文件、metaspace（类、方法信息）
+
+再来看一下官网推荐的内存需求
+|Profile Size|Profile Description	|CPUs	|RAM	|Local Blob Storage|
+|Small|Architecture 120,000 requests/hour200,000 requests/dayembedded H2 database|2|8GB|20GB|
+|Medium|Architecture 2100,000 requests/hour1,000,000 requests/dayexternal PostgreSQL database|4|8GB|200GB|
+|Large|Architecture 31,000,000 requests/hour10,000,000 requests/dayexternal PostgreSQL databaseHigh Availability deployment|4 per node|16GB per node|200GB or more|
+|Very Large|Architecture 42,000,000 requests/hour20,000,000 requests/dayexternal PostgreSQL databaseHigh Availability deployment|8 per node|32GB per node|10TB or more|
+
+最低需求就是2核8g，我的测试服务器也是2核8g，除了要部署nexus repository，还要部署gitea、mysql、nginx、应用服务等，不可能将整台服务器资源全部留给nexus repository。不过官方配置是生产稳定的最优配置，非强制门槛，考虑到我仅用于小团队内部的依赖管理，流量极小，也就不需要这么高的配置。
+
+堆内存是java程序存放数据、缓存、业务对象的空间，先降低到512m。将最小最大堆内存设置成一样，意味着堆内存固定，不会扩容和收缩。
+metaspace是存放类、方法、注解、jar包信息的空间，限制到256m。（题外话，我之前给自己写的元空间配置了最大内存限制，应用启动没问题，可是调用微信支付的时候报错了，提示元空间的内存溢出，可能是因为微信支付的sdk中有大量运行时加载的类，导致内存不够了，不过当时我也没有仔细研究，立马把这个配置删了，找个时间加个监控看看支付的时候内存会飙到多少）。
+DirectMemory是文件上传下载、网络传输、缓存文件块用的空间，限制到256m。
+
+修改配置完成之后重新nexus，再次执行top命令，nexus的内存占用已经降低到0.9g。
+
+### mysql内存优化
+首先执行查询
+```
+SELECT
+  SUBSTRING_INDEX(EVENT_NAME, '/', 2) AS component,
+  SUM(CURRENT_NUMBER_OF_BYTES_USED) / 1024 / 1024 AS memory_mb
+FROM performance_schema.memory_summary_global_by_event_name
+WHERE CURRENT_NUMBER_OF_BYTES_USED > 0
+GROUP BY component
+ORDER BY memory_mb DESC;
+```
+|component|mem|
+|memory/innodb|316.12483788|
+|memory/performance_schema|256.82736206|
+|memory/sql|74.75031662|
+|memory/mysys|9.29160118|
+|memory/temptable|6.00018311|
+这是内存占用最显著的五个组件。
+memory/innodb：mysql核心数据库引擎内存占用。
+memory/performance_schema：性能监控内存占用。虽然测试环境不太需要这个，但是我也不决定关闭，我需要啊，不开启性能监控那我连优化的思路都没有了。memory/innodb占用三百兆出头，算是比较正常。
+memory/sql：MySQL 处理 SQL 语法、解析、执行、连接管理的内存。无法优化。
+memory/mysys：MySQL 底层工具库。无法优化。
+memory/temptable：MySQL 做GROUP BY / ORDER BY / 临时表时用的内存表引擎。无法优化。
+综合来看，mysql几乎没有优化空间了。不过在perfomance_schema中查询到的mysql内部组件的内存占用只有六百多兆，但是实际top命令统计的是1.1g，有四百多兆的差距。
+
+### java应用内存优化
